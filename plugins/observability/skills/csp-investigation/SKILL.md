@@ -1,11 +1,13 @@
 ---
 name: observability-csp-investigation
 description: >
-  Investigate cloud-provider (CSP) service issues — AWS (RDS, Lambda, SQS, ALB, EC2),
-  and in future GCP and Azure — using OTel-schema cloud metrics in Elastic. Use when
-  diagnosing cloud-resource alerts: database connection/CPU/memory pressure, function
+  Investigate cloud-provider (CSP) service issues — AWS today (the reasoning applies to any
+  AWS service; schema and failure signatures are deepest for RDS, Lambda, SQS, ALB, EC2), and
+  in future GCP and Azure — using OTel-schema cloud metrics in Elastic. Use when
+  diagnosing cloud-resource problems, whether alert-triggered or ad hoc: database
+  connection/CPU/memory pressure, function
   error rates and throttling, queue backlog and consumer lag, load-balancer 5xx,
-  instance saturation. Correlates the alerting resource against its own baseline,
+  instance saturation. Correlates the resource under investigation against its own baseline,
   classifies the failure mode, and rules out co-occurring but unrelated conditions.
 metadata:
   author: elastic
@@ -18,30 +20,43 @@ Diagnose cloud-provider service issues from OTel-schema metrics and logs in Elas
 below are provider-agnostic and apply to every investigation. The per-provider **reference** carries the schema facts and
 failure-mode signatures that cannot be guessed — read it first.
 
+This is the CSP **domain layer**: which index holds a resource's telemetry, what shape its metrics take, and how to
+read them into a diagnosis. It assumes the harness can already author ES|QL — it does not teach query syntax, null
+handling, or function usage. Keep that split: this skill tells you *what* to query and *how to interpret* it; writing
+the query itself is the harness's job.
+
 ## Router — read the provider reference first
 
-Identify the provider from the alerting resource, then read its reference before writing any query (the index patterns,
+Identify the provider from the resource under investigation, then read its reference before writing any query (the index patterns,
 field shapes, and stat/aggregation rules there are unguessable, and a query written without them fails or silently
 corrupts its aggregates):
 
 | Provider | Resource types | Reference |
 | --- | --- | --- |
-| AWS | RDS, Lambda, SQS, ALB/ELB, EC2 (`metrics-aws.*`) | `references/aws.md` |
+| AWS | Any service under `metrics-aws.*`; failure signatures documented for RDS, Lambda, SQS, ALB/ELB, EC2 | `references/aws.md` |
 | GCP, Azure | — | not yet covered (see below) |
 
 If the provider is unclear, determine it from the data before assuming. For a provider without a reference yet, apply
 the provider-agnostic guidance below, discover the schema empirically (list indices → field mapping → probe query), cap
 confidence at medium, and say the reference was unavailable — never transplant another provider's schema.
 
+The same applies *within* a provider. For an AWS service the reference doesn't detail (DynamoDB, ECS, API Gateway,
+Kinesis, ElastiCache, …), the general guidance and the AWS-wide conventions still hold — the `metrics-aws.*` index
+family, backticked dotted/slashed field names, and per-`attributes.stat` filtering — so apply those, discover that
+service's specific metrics empirically, and cap confidence where no documented failure-mode signature exists. The
+guidelines below are service-agnostic by design; only the tuned signatures are per-service.
+
 ## Guidelines
 
-**Investigate the resource the alert names before anything else.** Shared clusters carry many systems' telemetry
+**Investigate the named resource before anything else — the one the alert fired on, or the one the
+request names.** Shared clusters carry many systems' telemetry
 (Kubernetes workloads, other teams' accounts, demo apps). Signals from co-resident systems are not evidence about this
 alert unless a dependency between them is demonstrated. Do not promote a louder co-resident anomaly to root cause.
 
 **The alert's own metric, compared to its own baseline, outranks everything else.** Before considering any other metric,
-quantify the alerting metric's incident-window value against the same resource's trailing baseline (45–60 minutes
-earlier). A 10×+ delta on the alert's metric is the primary thread; small wiggles in other metrics are secondary until
+quantify the alerting metric's incident-window value against a representative window of the same resource's own normal
+(how to choose that window — trailing vs same-time-prior-day — is in Flow below; the point is it must be *representative*,
+not merely adjacent). A 10×+ delta on the alert's metric is the primary thread; small wiggles in other metrics are secondary until
 the primary thread is exhausted. "High" is only meaningful relative to this resource's normal.
 
 **Counters up ≠ failing harder. Always compute the rate.** For error counters, divide by the volume counter
@@ -63,8 +78,9 @@ signals.
 **A healthy verdict is a first-class outcome, not a failure to find the problem.** Many workloads run with an ambient
 error rate of several percent at all times. If the named resource's incident-window numbers are indistinguishable from
 its baseline (rate ratio near 1×; volume, duration, throttles, backlog at baseline), the correct conclusion is that the
-alert is spurious or already resolved: state "ALERT FIRED BUT SYSTEM APPEARS HEALTHY", show the incident-vs-baseline
-numbers, and stop. Constructing a root-cause story out of ambient fluctuation is a worse failure than reporting no
+alert is spurious or already resolved (or, for an ad-hoc check with no alert, that there is no problem):
+state it plainly — "ALERT FIRED BUT SYSTEM APPEARS HEALTHY", or "NO PROBLEM FOUND — <resource> IS AT
+BASELINE" — show the incident-vs-baseline numbers, and stop. Constructing a root-cause story out of ambient fluctuation is a worse failure than reporting no
 incident.
 
 **Name exactly one primary cause; everything else is an effect, a contributor, or unrelated.** When one resource
@@ -85,8 +101,12 @@ ingested yet (cloud-metric pipelines typically lag by minutes — the provider r
 
 ## Flow
 
-Orient (resolve the resource + window; default incident window = alert time −20m to +5m, baseline = −50m to −20m, non-
-overlapping) → quantify the alert's own metric vs baseline → classify against the provider reference's failure-mode
+Orient (resolve the resource + windows; incident window brackets the time of interest — alert time, or the reported symptom
+time. Baseline = a *representative* span of the same resource's normal, chosen to match its rhythm: a short trailing window
+(~30–60m before the incident) is fine for a steady workload, but for anything with daily or weekly seasonality widen the
+window or compare against the same time-of-day on a prior comparable day — a half-hour adjacent baseline makes normal
+diurnal variation read as the incident. Windows must not overlap. When the resource's rhythm is unknown, look back far
+enough to see at least one full normal cycle before trusting "high") → quantify the alert's own metric vs baseline → classify against the provider reference's failure-mode
 signatures → corroborate (siblings, dependent/upstream resources only where a real dependency exists, shipped SLOs and
 active alerts in `.alerts-*` via `kibana.alert.instance.id LIKE "*<resource>*"`) → synthesize and stop. Terminate as
 soon as the evidence supports a classification at known confidence; exhaustive exploration is a failure mode. Anchor
@@ -97,5 +117,5 @@ severity on a VIOLATED SLO or active alert when present; never invent one.
 State: root cause (one sentence, named mode + resource), evidence with concrete numbers (incident vs baseline), causal
 chain, scope (which resources affected, which ruled out and why), recommended action targeting the actual mode, and
 confidence. Downgrade confidence when a discriminating signal was unavailable and say which. "ALERT FIRED BUT THE SYSTEM
-APPEARS HEALTHY" and "insufficient evidence for the named resource" are valid, complete conclusions when the data
-supports them.
+APPEARS HEALTHY" (or "no problem found" for an ad-hoc check) and "insufficient evidence for the named resource" are
+valid, complete conclusions when the data supports them.
